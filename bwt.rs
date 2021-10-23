@@ -22,17 +22,17 @@ fn read8(buf_in: &mut BufReader<File>, input: &mut [u8; 8]) -> usize {
 }
 // -----------------------------------------------------------------
 
-fn block_compare(a: u32, b: u32, block: &[u8]) -> Ordering {
-    let min = min(block[a as usize..].len(), block[b as usize..].len());
+fn block_compare(a: usize, b: usize, block: &[u8]) -> Ordering {
+    let min = min(block[a..].len(), block[b..].len());
 
     // Lexicographical comparison
-    let result = block[a as usize..(a as usize) + min].cmp(
-                &block[b as usize..(b as usize) + min]    );
+    let result = block[a..a + min].cmp(
+                &block[b..b + min]    );
     
     // Implement wraparound if needed
     if result == Ordering::Equal {
-        return [&block[(a as usize) + min..], &block[0..a as usize]].concat().cmp(
-              &[&block[(b as usize) + min..], &block[0..b as usize]].concat()    );
+        return [&block[a + min..], &block[0..a]].concat().cmp(
+              &[&block[b + min..], &block[0..b]].concat()    );
     }
     result    
 }
@@ -52,7 +52,7 @@ fn bwt_transform(file_in: &mut BufReader<File>, file_out: &mut BufWriter<File>, 
         for i in 0..indexes.len() { indexes[i as usize] = i as u32; }
         
         // Sort indexes
-        indexes[..].sort_by(|a, b| block_compare(*a, *b, file_in.buffer()));
+        indexes[..].sort_by(|a, b| block_compare(*a as usize, *b as usize, file_in.buffer()));
         
         // Get primary index and BWT output
         bwt.resize(file_in.buffer().len(), 0);
