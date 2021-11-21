@@ -7,6 +7,8 @@ bwt.exe c input output<br>
 Inverse Transform:<br>
 bwt.exe d input output<br>
 
+<hr>
+
 # fpaq0f-bwt
 
 bwt.exe only applies the transform to data, it doesn't compress it.<br> 
