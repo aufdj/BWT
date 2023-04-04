@@ -5,131 +5,218 @@ use std::path::Path;
 use std::time::Instant;
 use std::env;
 
-// Convenience functions for buffered IO ---------------------------
-fn write(buf_out: &mut BufWriter<File>, output: &[u8]) {
-    buf_out.write(output).unwrap();
-    if buf_out.buffer().len() >= buf_out.capacity() { 
-        buf_out.flush().unwrap(); 
-    }
-}
-fn read(buf_in: &mut BufReader<File>, input: &mut [u8; 1]) -> usize {
-    let bytes_read = buf_in.read(input).unwrap();
-    if buf_in.buffer().len() <= 0 { 
-        buf_in.consume(buf_in.capacity()); 
-        buf_in.fill_buf().unwrap();
-    }
-    bytes_read
-}
-fn read8(buf_in: &mut BufReader<File>, input: &mut [u8; 8]) -> usize {
-    let bytes_read = buf_in.read(input).unwrap();
-    if buf_in.buffer().len() <= 0 { 
-        buf_in.consume(buf_in.capacity()); 
-        buf_in.fill_buf().unwrap();
-    }
-    bytes_read
-}
-// -----------------------------------------------------------------
+const BLOCK_SIZE: usize = 1_048_576;
 
 
-// BWT Transform ---------------------------------------------------
-fn block_compare(a: usize, b: usize, block: &[u8]) -> Ordering {
+#[derive(PartialEq, Eq)]
+pub enum BufferState {
+    NotEmpty,
+    Empty,
+}
+impl BufferState {
+    fn is_eof(&self) -> bool {
+        *self == BufferState::Empty
+    }
+}
+
+pub trait BufferedRead {
+    fn read_byte(&mut self) -> u8;
+    fn read_u64(&mut self) -> u64;
+    fn fill_buffer(&mut self) -> BufferState;
+    fn read_byte_checked(&mut self) -> Option<u8>;
+}
+impl BufferedRead for BufReader<File> {
+    fn read_byte(&mut self) -> u8 {
+        let mut byte = [0u8; 1];
+
+        if self.read(&mut byte).is_ok() {
+            if self.buffer().is_empty() {
+                self.consume(self.capacity());
+                self.fill_buf().unwrap();
+            }
+        }
+        else {
+            println!("Function read_byte failed.");
+        }
+        u8::from_le_bytes(byte)
+    }
+
+    fn read_byte_checked(&mut self) -> Option<u8> {
+        let mut byte = [0u8; 1];
+
+        let bytes_read = self.read(&mut byte).unwrap();
+        if self.buffer().len() <= 0 { 
+            self.consume(self.capacity()); 
+            self.fill_buf().unwrap();
+        }
+        if bytes_read == 0 {
+            return None;
+        }
+        Some(u8::from_le_bytes(byte))
+    }
+    
+    fn read_u64(&mut self) -> u64 {
+        let mut bytes = [0u8; 8];
+
+        if let Ok(len) = self.read(&mut bytes) {
+            if self.buffer().is_empty() {
+                self.consume(self.capacity());
+                self.fill_buf().unwrap();
+                if len < 8 {
+                    self.read_exact(&mut bytes[len..]).unwrap();
+                }
+            }
+        }
+        else {
+            println!("Function read_u64 failed.");
+        }
+        u64::from_le_bytes(bytes)
+    }
+
+    fn fill_buffer(&mut self) -> BufferState {
+        self.consume(self.capacity());
+        self.fill_buf().unwrap();
+        if self.buffer().is_empty() {
+            return BufferState::Empty;
+        }
+        BufferState::NotEmpty
+    }
+}
+
+pub trait BufferedWrite {
+    fn write_byte(&mut self, output: u8);
+    fn write_u64(&mut self, output: u64);
+    fn flush_buffer(&mut self);
+}
+impl BufferedWrite for BufWriter<File> {
+    fn write_byte(&mut self, output: u8) {
+        self.write(&[output]).unwrap();
+        
+        if self.buffer().len() >= self.capacity() {
+            self.flush().unwrap();
+        }
+    }
+
+    fn write_u64(&mut self, output: u64) {
+        self.write(&output.to_le_bytes()[..]).unwrap();
+        
+        if self.buffer().len() >= self.capacity() {
+            self.flush().unwrap();
+        }
+    }
+
+    fn flush_buffer(&mut self) {
+        self.flush().unwrap(); 
+    }
+}
+
+
+fn new_input_file(capacity: usize, file_name: &str) -> BufReader<File> {
+    BufReader::with_capacity(
+        capacity, File::open(file_name).unwrap()
+    )
+}
+
+fn new_output_file(capacity: usize, file_name: &str) -> BufWriter<File> {
+    BufWriter::with_capacity(
+        capacity, File::create(file_name).unwrap()
+    )
+}
+
+
+
+struct Bwt {
+    file_in: BufReader<File>,
+    file_out: BufWriter<File>,
+}
+impl Bwt {
+    fn new(file_in: BufReader<File>, file_out: BufWriter<File>) -> Self {
+        Self {
+            file_in,
+            file_out,
+        }
+    }
+
+    fn transform(&mut self) {
+        loop {
+            if self.file_in.fill_buffer().is_eof() { break; }
+            let len = self.file_in.buffer().len();
+
+            let mut indices = (0..len as u32).collect::<Vec<u32>>();
+
+            indices.sort_by(|a, b| { 
+                block_cmp(*a as usize, *b as usize, self.file_in.buffer())
+            });
+
+            let primary_index = indices.iter().position(|&i| i == 1).unwrap();
+
+            let bwt = (0..len).zip(indices.iter()).map(|(_, &idx)| {
+                if idx == 0 { 
+                    self.file_in.buffer()[len - 1]
+                } 
+                else {
+                    self.file_in.buffer()[(idx as usize) - 1]
+                }   
+            })
+            .collect::<Vec<u8>>();
+        
+            self.file_out.write_u64(primary_index as u64);
+            self.file_out.write_all(&bwt).unwrap();
+        }  
+        self.file_out.flush_buffer(); 
+    }
+
+    fn inverse_transform(&mut self) {
+        let mut transform = vec![0u32; BLOCK_SIZE];
+
+        loop {
+            if self.file_in.fill_buffer().is_eof() { break; }
+        
+            let mut index = self.file_in.read_u64() as usize;
+
+            let mut count = [0u32; 256];
+            let mut cumul = [0u32; 256];
+
+            for byte in self.file_in.buffer().iter() {
+                count[*byte as usize] += 1;    
+            }
+
+            let mut sum = 0;
+            for i in 0..256 {
+                cumul[i] = sum;
+                sum += count[i];
+                count[i] = 0;
+            }
+
+            for (i, byte) in self.file_in.buffer().iter().enumerate() {
+                let byte = *byte as usize;
+                transform[(count[byte] + cumul[byte]) as usize] = i as u32;
+                count[byte] += 1;
+            }
+
+            for _ in 0..self.file_in.buffer().len() { 
+                self.file_out.write_byte(self.file_in.buffer()[index]);
+                index = transform[index] as usize;
+            }
+        } 
+        self.file_out.flush().unwrap();
+    }
+}
+
+fn block_cmp(a: usize, b: usize, block: &[u8]) -> Ordering {
     let min = min(block[a..].len(), block[b..].len());
 
     // Lexicographical comparison
-    let result = block[a..a + min].cmp(
-                &block[b..b + min]    );
+    let result = block[a..a + min].cmp(&block[b..b + min]);
     
-    // Implement wraparound if needed
+    // Wraparound if needed
     if result == Ordering::Equal {
-        return [&block[a + min..], &block[0..a]].concat().cmp(
-              &[&block[b + min..], &block[0..b]].concat()    );
+        let remainder_a = [&block[a + min..], &block[0..a]].concat();
+        let remainder_b = [&block[b + min..], &block[0..b]].concat();
+        return remainder_a.cmp(&remainder_b);
     }
     result   
 }
-fn bwt_transform(file_in: &mut BufReader<File>, file_out: &mut BufWriter<File>, block_size: usize) { 
-    let mut primary_index: usize = 0; // starting position for inverse transform
-    let mut indexes: Vec<u32> = Vec::with_capacity(block_size); // indexes into block
-    let mut bwt: Vec<u8> = Vec::with_capacity(block_size); // BWT output
-    
-    loop {
-        file_in.consume(file_in.capacity());
-        file_in.fill_buf().unwrap();
-        if file_in.buffer().is_empty() { break; }
-        
-        // Create indexes into block
-        indexes.resize(file_in.buffer().len(), 0);
-        for i in 0..indexes.len() { indexes[i as usize] = i as u32; }
-        
-        // Sort indexes
-        indexes[..].sort_by(|a, b| block_compare(*a as usize, *b as usize, file_in.buffer()));
-        
-        // Get primary index and BWT output
-        bwt.resize(file_in.buffer().len(), 0);
-        for i in 0..bwt.len() {
-            if indexes[i] == 1 {
-                primary_index = i;
-            }
-            if indexes[i] == 0 { 
-                bwt[i] = file_in.buffer()[file_in.buffer().len() - 1];
-            } else {
-                bwt[i] = file_in.buffer()[(indexes[i] as usize) - 1];
-            }    
-        } 
-    
-        write(file_out, &primary_index.to_le_bytes()[..]);
-        for byte in bwt.iter() {
-            write(file_out, &byte.to_le_bytes()[..]);
-        }
-    }  
-    file_out.flush().unwrap();  
-}
-fn inverse_bwt_transform(file_in: &mut BufReader<File>, file_out: &mut BufWriter<File>, block_size: usize) {
-    let mut transform_vector: Vec<u32> = Vec::with_capacity(block_size); // For inverting transform
-
-    loop {
-        file_in.consume(file_in.capacity());
-        file_in.fill_buf().unwrap();
-        if file_in.buffer().is_empty() { break; }
-    
-        // Read primary index
-        let mut primary_index = [0u8; 8];
-        read8(file_in, &mut primary_index);
-        let primary_index = usize::from_le_bytes(primary_index);
-
-        let mut counts = [0u32; 256];
-        let mut cumul_counts = [0u32; 256];
-
-        // Get number of occurences for each byte
-        for byte in file_in.buffer().iter() {
-            counts[*byte as usize] += 1;    
-        }
-
-        // Get cumulative counts for each byte
-        let mut sum = 0;
-        for i in 0..256 {
-            cumul_counts[i] = sum;
-            sum += counts[i];
-            counts[i] = 0;
-        }
-
-        // Build transformation vector
-        transform_vector.resize(file_in.buffer().len(), 0);
-        for i in 0..file_in.buffer().len() {
-            let index = file_in.buffer()[i] as usize; 
-            transform_vector[(counts[index] + cumul_counts[index]) as usize] = i as u32;
-            counts[index] += 1;
-        }
-
-        // Invert transform and output original data
-        let mut index = primary_index;
-        for _ in 0..file_in.buffer().len() { 
-            write(file_out, &file_in.buffer()[index].to_le_bytes()[..]);
-            index = transform_vector[index] as usize;
-        }
-    } 
-    file_out.flush().unwrap();   
-}
-// -----------------------------------------------------------------
 
 
 const STATE_TABLE: [[u8; 2]; 256] = [
@@ -171,257 +258,238 @@ const STATE_TABLE: [[u8; 2]; 256] = [
 [249,135],[250, 69],[ 80,251],[140,252],[249,135],[250, 69],[ 80,251], // 245
 [140,252],[  0,  0],[  0,  0],[  0,  0]];  // 252
 
-const N: usize = 65_536;  // number of contexts
-const LIMIT: usize = 127; // controls rate of adaptation (higher = slower) (0..512)
 
+fn next_state(state: u8, bit: i32) -> u8 {
+    STATE_TABLE[state as usize][bit as usize]
+}
 
-// StateMap --------------------------------------------------------
+#[allow(overflowing_literals)]
+const PR_MSK: i32 = 0xFFFFFC00; // High 22 bit mask
+const LIMIT: usize = 127; // Controls rate of adaptation (higher = slower) (0..512)
+
 struct StateMap {
-    context:        usize,         // context of last prediction
-    context_map:    Box<[u32; N]>, // maps a context to a prediction and a count (allocate on heap to avoid stack overflow)
-    recipr_table:  [i32; 512],     // controls the size of each adjustment to context_map
+    cxt:     usize,     
+    cxt_map: Vec<u32>, // Maps a context to a prediction and a count 
+    rec_t:   Vec<u16>, // Reciprocal table: controls adjustment to cxt_map
 }
 impl StateMap {
-    fn new() -> StateMap {
-        let mut statemap = StateMap { 
-            context:        0,
-            context_map:    Box::new([0; N]),
-            recipr_table:  [0; 512],
-        };
+    fn new(n: usize) -> StateMap {
+        StateMap { 
+            cxt:      0,
+            cxt_map:  vec![1 << 31; n],
+            rec_t:    (0..512).map(|i| 16384/(i+i+3)).collect(),
+        }
+    }
 
-        for i in 0..N { 
-            statemap.context_map[i] = 1 << 31; 
-        }
-        if statemap.recipr_table[0] == 0 {
-            for i in 0..512 { 
-                statemap.recipr_table[i] = (32_768 / (i + i + 5)) as i32; 
-            }
-        }
-        statemap
+    fn p(&mut self, cxt: usize) -> i32 {                   
+        self.cxt = cxt;
+        (self.cxt_map[self.cxt] >> 16) as i32  
     }
-    fn p(&mut self, cx: usize) -> u32 {
-        self.context = cx;
-        self.context_map[self.context] >> 16
-    }
+
     fn update(&mut self, bit: i32) {
-        let count: usize = (self.context_map[self.context] & 511) as usize;  // low 9 bits
-        let prediction: i32 = (self.context_map[self.context] >> 14) as i32; // high 18 bits
+        assert!(bit == 0 || bit == 1);  
+        let count = (self.cxt_map[self.cxt] & 1023) as usize; // Low 10 bits
+        let pr    = (self.cxt_map[self.cxt] >> 10 ) as i32;   // High 22 bits
 
-        if count < LIMIT { self.context_map[self.context] += 1; }
+        if count < LIMIT { self.cxt_map[self.cxt] += 1; }
 
-        // updates context_map based on the difference between the predicted and actual bit
-        #[allow(overflowing_literals)]
-        let high_23_bit_mask: i32 = 0xfffffe00;
-        self.context_map[self.context] = self.context_map[self.context].wrapping_add(
-        (((bit << 18) - prediction) * self.recipr_table[count] & high_23_bit_mask) as u32);
-        
+        // Update cxt_map based on prediction error
+        let pr_err = ((bit << 22) - pr) >> 3; // Prediction error
+        let rec_v = self.rec_t[count] as i32; // Reciprocal value
+        self.cxt_map[self.cxt] = 
+        self.cxt_map[self.cxt].wrapping_add((pr_err * rec_v & PR_MSK) as u32); 
     }
 }
-// -----------------------------------------------------------------
 
-
-// Predictor -------------------------------------------------------
 struct Predictor {
-    context:   usize,
-    statemap:  StateMap,
-    state:     [u8; 256],
+    cxt:   usize,
+    sm:    StateMap,
+    state: [u8; 256],
 }
 impl Predictor {
     fn new() -> Predictor {
         Predictor {
-            context:   0,
-            statemap:  StateMap::new(),
-            state:     [0; 256],
+            cxt:    0,
+            sm:     StateMap::new(65536),
+            state:  [0; 256],
         }
     }
-    fn p(&mut self) -> u32 { 
-        self.statemap.p(self.context * 256 + self.state[self.context] as usize) 
+
+    fn p(&mut self) -> i32 { 
+        self.sm.p(self.cxt * 256 + self.state[self.cxt] as usize) 
     } 
+
     fn update(&mut self, bit: i32) {
-        self.statemap.update(bit);
+        self.sm.update(bit);
 
-        self.state[self.context] = STATE_TABLE[self.state[self.context] as usize][bit as usize];
+        self.state[self.cxt] = next_state(self.state[self.cxt], bit);
 
-        self.context += self.context + bit as usize;
-        if self.context >= 256 { self.context = 0; }
+        self.cxt += self.cxt + bit as usize;
+        if self.cxt >= 256 { self.cxt = 0; }
     }
 }
-// -----------------------------------------------------------------
 
 
-// Encoder ---------------------------------------------------------
-#[derive(PartialEq, Eq)]
-enum Mode {
-    Compress,
-    Decompress,
-}
-
-#[allow(dead_code)]
 struct Encoder {
-    high:       u32,
-    low:        u32,
-    predictor:  Predictor,
-    file_in:    BufReader<File>,
-    file_out:   BufWriter<File>,
-    x:          u32,
-    mode:       Mode,
+    high:      u32,
+    low:       u32,
+    predictor: Predictor,
+    archive:   BufWriter<File>,
 }
 impl Encoder {
-    fn new(predictor: Predictor, file_in: BufReader<File>, file_out: BufWriter<File>, mode: Mode) -> Encoder {
-        let mut e = Encoder {
+    fn new(archive: BufWriter<File>) -> Self {
+        Self {
             high: 0xFFFFFFFF, 
             low: 0, 
-            x: 0, 
-            predictor, file_in, file_out, mode
-        };
-
-        // During decompression, initialize x to 
-        // first 4 bytes of compressed data
-        if e.mode == Mode::Decompress {
-            let mut byte = [0; 1];
-            for _ in 0..4 {
-                read(&mut e.file_in, &mut byte);
-                e.x = (e.x << 8) + byte[0] as u32;
-            }
+            predictor: Predictor::new(), 
+            archive
         }
-        e
     }
+
     fn compress_bit(&mut self, bit: i32) {
-        // Compress bit
-        let p: u32 = self.predictor.p();
-        let mid: u32 = self.low + ((self.high - self.low) >> 16) * p + ((self.high - self.low & 0xFFFF) * p >> 16);
+        let mut p = self.predictor.p() as u32;
+        if p < 2048 { p += 1; }
+
+        let range = self.high - self.low;
+        let mid: u32 = self.low + (range >> 16) * p
+                       + ((range & 0x0FFF) * p >> 16);
+                       
         if bit == 1 {
             self.high = mid;
-        } else {
+        } 
+        else {
             self.low = mid + 1;
         }
-
-        // Update model with new bit
         self.predictor.update(bit);
-
-        // Write identical leading MSB to output
+        
         while ( (self.high ^ self.low) & 0xFF000000) == 0 {
-            write(&mut self.file_out, &self.high.to_le_bytes()[3..4]);
+            self.archive.write_byte((self.high >> 24) as u8);
             self.high = (self.high << 8) + 255;
             self.low <<= 8;  
         }
     }
+
+    fn flush(&mut self) {
+        while ( (self.high ^ self.low) & 0xFF000000) == 0 {
+            self.archive.write_byte((self.high >> 24) as u8);
+            self.high = (self.high << 8) + 255;
+            self.low <<= 8; 
+        }
+        self.archive.write_byte((self.high >> 24) as u8);
+        self.archive.flush_buffer();
+    }
+}
+
+struct Decoder {
+    high:      u32,
+    low:       u32,
+    predictor: Predictor,
+    archive:   BufReader<File>,
+    x:         u32, 
+}
+impl Decoder {
+    fn new(archive: BufReader<File>) -> Self {
+        let mut dec = Self {
+            high: 0xFFFFFFFF, 
+            low: 0, 
+            x: 0, 
+            predictor: Predictor::new(), 
+            archive,
+        };
+        for _ in 0..4 {
+            dec.x = (dec.x << 8) + dec.archive.read_byte() as u32;
+        }
+        dec
+    }
+    
     fn decompress_bit(&mut self) -> i32 {
-        // Decompress bit
-        let p: u32 = self.predictor.p();
-        let mid: u32 = self.low + ((self.high - self.low) >> 16) * p + ((self.high - self.low & 0xFFFF) * p >> 16);
+        let mut p = self.predictor.p() as u32;
+        if p < 2048 { p += 1; }
+
+        let range = self.high - self.low;
+        let mid: u32 = self.low + (range >> 16) * p
+                       + ((range & 0x0FFF) * p >> 16);
+
         let mut bit: i32 = 0;
         if self.x <= mid {
             bit = 1;
             self.high = mid;
-        } else {
+        } 
+        else {
             self.low = mid + 1;
         }
-
-        // Update model with new bit
         self.predictor.update(bit);
         
-        // Write identical leading MSB to output and read new byte 
-        let mut byte = [0; 1];
         while ( (self.high ^ self.low) & 0xFF000000) == 0 {
             self.high = (self.high << 8) + 255;
-            self.low <<= 8;
-            read(&mut self.file_in, &mut byte); 
-            self.x = (self.x << 8) + byte[0] as u32; 
+            self.low <<= 8; 
+            self.x = (self.x << 8) + self.archive.read_byte() as u32; 
         }
         bit
     }
-    fn flush(&mut self) {
-        while ( (self.high ^ self.low) & 0xFF000000) == 0 {
-            write(&mut self.file_out, &self.high.to_le_bytes()[3..4]);
-            self.high = (self.high << 8) + 255;
-            self.low <<= 8; 
-        }
-        write(&mut self.file_out, &self.high.to_le_bytes()[3..4]);  
-        self.file_out.flush().unwrap();
-    }
 }
-// -----------------------------------------------------------------
 
 
 fn main() {
     let start_time = Instant::now();
     let args: Vec<String> = env::args().collect();
-    
-    // Encoder buffers
-    let e_file_in  =   BufReader::with_capacity(4096, File::open(&args[2]).unwrap());
-    let e_file_out =   BufWriter::with_capacity(4096, File::create(&args[3]).unwrap());
-
-    let block_size: usize = 1_048_576;
+    let temp = "temp";
 
     match (&args[1]).as_str() {
-        "c" => {  
-            let mut e = Encoder::new(Predictor::new(), e_file_in, e_file_out, Mode::Compress);
-            // Transform               | Compression
-            // file_in -> bwt_file_out | bwt_file_in -> file_out
-            
-            // BWT ----------------------------------------------
-            let mut file_in = BufReader::with_capacity(block_size, File::open(&args[2]).unwrap());
-            let mut bwt_file_out = BufWriter::with_capacity(4096, File::create("bwt_temp.bin").unwrap());
-            bwt_transform(&mut file_in, &mut bwt_file_out, block_size);
-            drop(bwt_file_out);
-            // --------------------------------------------------
+        "c" => {
+            let file_in = new_input_file(BLOCK_SIZE, &args[2]);
+            let bwt_out = new_output_file(4096, temp);
+            Bwt::new(file_in, bwt_out).transform();
 
-            // Compression --------------------------------------
-            let mut bwt_file_in = BufReader::with_capacity(4096, File::open("bwt_temp.bin").unwrap());
-            bwt_file_in.fill_buf().unwrap();
+            let mut bwt_in = new_input_file(4096, temp);
+            let file_out = new_output_file(4096, &args[3]);
+            let mut enc = Encoder::new(file_out);
+            bwt_in.fill_buf().unwrap();
     
-            let mut byte = [0; 1];
-            while read(&mut bwt_file_in, &mut byte) != 0 {
-                e.compress_bit(1);
+            while let Some(byte) = bwt_in.read_byte_checked() {
+                enc.compress_bit(1);
                 for i in (0..=7).rev() {
-                    e.compress_bit(((byte[0] >> i) & 1).into());
+                    enc.compress_bit(((byte >> i) & 1).into());
                 } 
             }   
-            e.compress_bit(0);
-            e.flush(); 
-            // --------------------------------------------------
-            remove_file("bwt_temp.bin").unwrap();
+            enc.compress_bit(0);
+            enc.flush(); 
+            
+            remove_file(temp).unwrap();
 
-            let file_in_size  = metadata(Path::new(&args[2])).unwrap().len();
-            let file_out_size = metadata(Path::new(&args[3])).unwrap().len();
-            println!("Finished Compressing.");   
-            println!("{} bytes -> {} bytes in {:.2?}", file_in_size, file_out_size, start_time.elapsed());    
+            println!("Finished Compressing.");     
         }
         "d" => {
-            let mut e = Encoder::new(Predictor::new(), e_file_in, e_file_out, Mode::Decompress);
-            // Decompression           | Inverse Transform
-            // file_in -> bwt_file_out | bwt_file_in -> file_out
-            
-            // Decompression ------------------------------------
-            let mut bwt_file_out = BufWriter::with_capacity(4096, File::create("bwt_i_temp.bin").unwrap());
-            while e.decompress_bit() != 0 {   
+            let file_in = new_input_file(4096, &args[2]);
+            let mut bwt_out = new_output_file(4096, temp);
+            let mut dec = Decoder::new(file_in);
+    
+            while dec.decompress_bit() != 0 {   
                 let mut decoded_byte: i32 = 1;
                 while decoded_byte < 256 {
-                    decoded_byte += decoded_byte + e.decompress_bit();
+                    decoded_byte += decoded_byte + dec.decompress_bit();
                 }
                 decoded_byte -= 256;
-                write(&mut bwt_file_out, &decoded_byte.to_le_bytes()[0..1]);
+                bwt_out.write_byte(decoded_byte as u8);
             }
-            bwt_file_out.flush().unwrap();
-            drop(bwt_file_out);
-            // --------------------------------------------------
+            bwt_out.flush().unwrap();
+            drop(bwt_out);
 
-            // Inverse BWT --------------------------------------
-            let mut bwt_file_in = BufReader::with_capacity(block_size + 8, File::open("bwt_i_temp.bin").unwrap());
-            let mut file_out = BufWriter::with_capacity(4096, File::create(&args[3]).unwrap());
-            inverse_bwt_transform(&mut bwt_file_in, &mut file_out, block_size);
-            // --------------------------------------------------
-            remove_file("bwt_i_temp.bin").unwrap();
+            let bwt_in = new_input_file(BLOCK_SIZE + 8, temp);
+            let file_out = new_output_file(4096, &args[3]);
+            Bwt::new(bwt_in, file_out).inverse_transform();
+            remove_file(temp).unwrap();
 
-            let file_in_size  = metadata(Path::new(&args[2])).unwrap().len();
-            let file_out_size = metadata(Path::new(&args[3])).unwrap().len();
-            println!("Finished Decompressing.");  
-            println!("{} bytes -> {} bytes in {:.2?}", file_in_size, file_out_size, start_time.elapsed());   
+            println!("Finished Decompressing.");   
         }
         _ => { 
             println!("To Compress: c input output");
             println!("To Decompress: d input output");
         }
     } 
+    println!("{} bytes -> {} bytes in {:.2?}", 
+        metadata(Path::new(&args[2])).unwrap().len(), 
+        metadata(Path::new(&args[3])).unwrap().len(), 
+        start_time.elapsed()
+    );   
 }
